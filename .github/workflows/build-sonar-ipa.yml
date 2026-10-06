@@ -1,0 +1,173 @@
+# 在 GitHub 的 macOS 云主机上把 Sonar 编译成「未签名 IPA」
+#
+# ┌─ 放置位置 ────────────────────────────────────────────────┐
+# │  你的 GitHub 仓库里的：.github/workflows/build-sonar-ipa.yml  │
+# └──────────────────────────────────────────────────────────┘
+#
+# 触发方式：仓库页面 → Actions → 左侧选 “Build Sonar IPA” → Run workflow
+# 产物位置：该次运行页面底部的 Artifacts → Sonar-unsigned-ipa
+#
+# 说明：
+#   * 默认直接从上游 can4hou6joeng4/Sonar 拉源码，所以你不需要 Fork。
+#   * 公共仓库使用 macOS runner 是免费的（私有仓库按 10 倍分钟计费）。
+#   * 产物是**未签名** IPA，必须用 Sideloadly / AltStore 之类的工具
+#     用你自己的 Apple ID 重新签名后才能装进 iPhone。
+
+name: Build Sonar IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Sonar 源码仓库（owner/repo）"
+        type: string
+        default: "can4hou6joeng4/Sonar"
+        required: true
+      source_ref:
+        description: "分支 / tag / commit"
+        type: string
+        default: "main"
+        required: true
+      strip_widget:
+        description: "剥离桌面小组件扩展（免费 Apple ID 请保持 true）"
+        type: boolean
+        default: true
+      node_version:
+        description: "Node.js 版本（用于打包音源 bundle）"
+        type: string
+        default: "24"
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. 取源码 ────────────────────────────────────────────
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_ref }}
+          path: src
+
+      # ── 2. Node 环境（音源是 JS，必须先打成 bundle）───────────
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      # Xcode 的 Run Script 阶段不会继承 setup-node 的完整 PATH，
+      # 这里在 /usr/local/bin 放一份软链接兜底（Sonar 的构建脚本要用 node）。
+      - name: 让 Xcode 构建脚本能找到 node
+        run: |
+          set -euo pipefail
+          sudo ln -sf "$(command -v node)" /usr/local/bin/node
+          sudo ln -sf "$(command -v npm)"  /usr/local/bin/npm
+          node --version
+
+      # ── 3. 选最新的 Xcode ─────────────────────────────────────
+      - name: 选择最新的 Xcode
+        run: |
+          set -euo pipefail
+          LATEST=$(python3 -c "import glob,re;c=[([int(n) for n in re.findall(r'\d+',p.split('Xcode')[-1])],p) for p in glob.glob('/Applications/Xcode*.app')];c.sort();print(c[-1][1] if c else '')")
+          if [ -n "$LATEST" ]; then
+            echo "==> 使用 $LATEST"
+            sudo xcode-select -s "$LATEST/Contents/Developer"
+          fi
+          xcodebuild -version
+          echo "--- 可用的 iOS SDK ---"
+          xcodebuild -showsdks | grep -i iphoneos || true
+
+      # ── 4. 打音源 bundle ─────────────────────────────────────
+      # 产物 Sonar/Resources/source-bundle.js 被 .gitignore 忽略，
+      # 必须在这步生成，否则 app 装上去搜索/播放全是空的。
+      - name: 构建音源 bundle
+        working-directory: src
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build:source
+          ls -lh Sonar/Resources/source-bundle.js
+
+      # ── 5. 编译（彻底关闭代码签名）───────────────────────────
+      - name: 编译 Release（关闭代码签名）
+        working-directory: src
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Sonar.xcodeproj \
+            -scheme Sonar \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            DEVELOPMENT_TEAM='' \
+            build
+
+      # ── 6. 组装成 IPA ────────────────────────────────────────
+      - name: 打包成 IPA
+        working-directory: src
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release-iphoneos/Sonar.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::没有找到 $APP，构建产物结构可能变了"
+            find build/Build/Products -maxdepth 3 -name '*.app' || true
+            exit 1
+          fi
+
+          STAGE="$RUNNER_TEMP/ipa"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/Payload"
+          cp -R "$APP" "$STAGE/Payload/"
+
+          # 免费 Apple ID 的签名描述文件不带 App Groups 能力，
+          # 内嵌的 Widget 扩展会导致「无法验证完整性」这类安装失败。
+          # Sonar 的主程序对 App Group 有兜底（退回 Caches 目录），
+          # 歌单本身存在 Application Support，所以砍掉小组件不影响听歌。
+          if [ '${{ inputs.strip_widget }}' = 'true' ]; then
+            rm -rf "$STAGE/Payload/Sonar.app/PlugIns"
+            echo "==> 已移除小组件扩展（PlugIns/）"
+          fi
+
+          rm -f "$STAGE/Payload/Sonar.app/embedded.mobileprovision"
+
+          ( cd "$STAGE" && zip -qry "$GITHUB_WORKSPACE/Sonar-unsigned.ipa" Payload )
+          ls -lh "$GITHUB_WORKSPACE/Sonar-unsigned.ipa"
+
+      # ── 7. 校验产物 ──────────────────────────────────────────
+      - name: 校验 IPA 结构
+        run: |
+          set -euo pipefail
+          IPA="$GITHUB_WORKSPACE/Sonar-unsigned.ipa"
+          OUT="$RUNNER_TEMP/verify"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          unzip -q "$IPA" -d "$OUT"
+
+          echo "--- Payload ---"
+          ls "$OUT/Payload"
+          echo "--- Bundle ID ---"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier'        "$OUT/Payload/Sonar.app/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$OUT/Payload/Sonar.app/Info.plist"
+          echo "--- 可执行文件 ---"
+          test -f "$OUT/Payload/Sonar.app/Sonar"
+          ls -lh "$OUT/Payload/Sonar.app/Sonar"
+          echo "--- 音源 bundle ---"
+          find "$OUT/Payload/Sonar.app" -name 'source-bundle.js' -print
+          echo "==> IPA 校验通过"
+
+      # ── 8. 上传 ──────────────────────────────────────────────
+      - name: 上传 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sonar-unsigned-ipa
+          path: Sonar-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
